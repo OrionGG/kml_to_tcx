@@ -23,3 +23,6 @@ ENV/
 
 # Output files
 *.tcx
+
+# Input files
+**/*.kml
