@@ -92,26 +92,44 @@ def load_trackpoints(tcx_path, verbose=False):
     return tree, root, ns, points
 
 def write_vmg_to_tcx(tree, root, ns, points, vmg_list, out_path, precision=3, verbose=False):
+    if verbose: print(f"Main namespace: {ns}")
+    
+    # Register the main namespace
     if ns:
         ET.register_namespace('', ns)
-        alt_tag = f"{{{ns}}}AltitudeMeters"
         nsmap = {'ns': ns}
     else:
-        alt_tag = 'AltitudeMeters'
         nsmap = {}
+    
+    # Set up namespace map including ns0 for ActivityExtension
+    nsmap['ns0'] = 'http://www.garmin.com/xmlschemas/ActivityExtension/v2'
+    
     for i, p in enumerate(points):
         tp = p['elem']
-        existing = tp.findall('ns:AltitudeMeters', nsmap) if ns else tp.findall('AltitudeMeters')
-        for ex in existing:
-            tp.remove(ex)
-        if i < len(vmg_list):
-            v = vmg_list[i]
-        else:
-            v = vmg_list[-1] if vmg_list else 0.0
-        alt = ET.Element(alt_tag)
-        fmt = f"{{:.{precision}f}}"
-        alt.text = fmt.format(v)
-        tp.append(alt)
+        
+        # Remove any existing AltitudeMeters elements
+        alt_elements = tp.findall('ns:AltitudeMeters', nsmap) if ns else tp.findall('AltitudeMeters')
+        for alt_elem in alt_elements:
+            tp.remove(alt_elem)
+        
+        # Find Extensions -> ns0:TPX -> ns0:Speed path
+        extensions = tp.find('ns:Extensions', nsmap) if ns else tp.find('Extensions')
+        if extensions is not None:
+            tpx = extensions.find('ns0:TPX', nsmap)
+            if tpx is not None:
+                speed_elem = tpx.find('ns0:Speed', nsmap)
+                if speed_elem is not None:
+                    # Update the speed value with VMG
+                    if i < len(vmg_list):
+                        v = vmg_list[i]
+                    else:
+                        v = vmg_list[-1] if vmg_list else 0.0
+                    
+                    fmt = f"{{:.{precision}f}}"
+                    speed_elem.text = fmt.format(v)
+                    
+                    if verbose: print(f"Updated trackpoint {i} speed to: {speed_elem.text}")
+    
     if verbose: print(f"Writing new TCX to: {out_path}")
     tree.write(out_path, encoding='utf-8', xml_declaration=True)
 
