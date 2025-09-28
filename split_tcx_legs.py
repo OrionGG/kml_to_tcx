@@ -2,26 +2,20 @@
 """
 split_tcx_legs.py
 
-Split a single TCX track into 8 named legs (TCX files) using waypoint times provided
-as times from the beginning of the track. Waypoints may be entered as:
-  - mm:ss  (e.g. 03:30 means 3 minutes 30 seconds from start)
-  - decimal minutes (e.g. 3.5 means 3.5 minutes = 3 minutes 30 seconds)
-  - a comma-separated list or space-separated values
+Improved TCX splitter for sailing race legs with Garmin-friendly output.
 
-Changes requested:
-- Output files are saved in a subfolder named `race_legs` (inside the input folder or provided outdir)
-- Files are named using the prescribed leg names:
-    leg_00_pre-start
-    leg_01_upwind
-    leg_02_starboard_reach
-    leg_03_downwind
-    leg_04_upwind
-    leg_05_downwind
-    leg_06_port_reach
-    leg_07_post_finish
+Features / fixes applied:
+- Waypoints accepted in mm:ss or decimal minutes (unchanged)
+- Outputs saved into a `race_legs` folder inside the input folder (or inside --outdir)
+- Filenames use the requested leg names (leg_00_pre-start ... leg_07_post_finish)
+- Garmin-required fields added to each <Lap>: DistanceMeters, Calories, Intensity, TriggerMethod
+- Ensures every leg has at least one Trackpoint. If a leg would be empty, the script
+  duplicates the nearest available trackpoint and sets its <Time> to the leg start time.
+- If Trackpoint elements lack Position or DistanceMeters, we add a DistanceMeters=0.0 to
+  make files more acceptable to Garmin Connect.
 
 Usage
-    python split_tcx_legs.py --input /path/to/track.tcx --waypoints 0 3:30 8:12 12:00 17 21:00 24:00
+    python split_tcx_legs.py -i /path/to/OGG.tcx -w 0 03:30 08:12 12:00 17 21:00 24:00
 
 """
 
@@ -56,20 +50,12 @@ def parse_args():
 
 
 def parse_time_token(tok):
-    """Parse a single token into seconds (float).
-
-    Accepted formats:
-      - "MM:SS" or "M:SS" or "H:MM:SS" -> interpreted as minutes:seconds (or hours:minutes:seconds)
-      - decimal number like "3.5" -> interpreted as minutes (3.5 minutes = 210 seconds)
-      - integer like "3" -> interpreted as minutes
-    """
     tok = tok.strip()
     if not tok:
         raise ValueError('Empty waypoint token')
     if ':' in tok:
         parts = tok.split(':')
         try:
-            # allow H:MM:SS or MM:SS
             if len(parts) == 2:
                 minutes = float(parts[0])
                 seconds = float(parts[1])
@@ -84,7 +70,6 @@ def parse_time_token(tok):
         except ValueError:
             raise ValueError(f'Invalid mm:ss or hh:mm:ss value: {tok}')
     else:
-        # interpret as decimal minutes
         try:
             minutes = float(tok)
         except ValueError:
@@ -94,7 +79,6 @@ def parse_time_token(tok):
 
 
 def _parse_waypoints(wp_args):
-    # wp_args can be a list like ['0','3:30',...] or a single string '0,3:30,...'
     if len(wp_args) == 1 and ',' in wp_args[0]:
         items = [x.strip() for x in wp_args[0].split(',') if x.strip()]
     else:
@@ -104,22 +88,19 @@ def _parse_waypoints(wp_args):
     secs = []
     for t in items:
         secs.append(parse_time_token(t))
-    # ensure ascending order
     if any(secs[i] > secs[i+1] for i in range(len(secs)-1)):
         raise ValueError('Waypoints must be in non-decreasing order (ascending).')
     return secs
 
 
 def _iso_to_dt(s):
-    # handle trailing Z and subsecond formats by replacing Z with +00:00
     if s.endswith('Z'):
         s = s[:-1] + '+00:00'
-    # Python's fromisoformat handles offsets like +00:00
     return datetime.fromisoformat(s)
 
 
 def _dt_to_iso_z(dt):
-    # return ISO with Z for UTC if tzinfo is UTC-like
+    # Return ISO8601 with Z for UTC-like datetimes, otherwise isoformat()
     if dt.tzinfo is None:
         return dt.isoformat() + 'Z'
     else:
@@ -130,13 +111,11 @@ def _dt_to_iso_z(dt):
 
 
 def collect_trackpoints(root):
-    # detect namespace
     tag = root.tag
     ns = ''
     if tag.startswith('{'):
         ns = tag[1:].split('}')[0]
 
-    # find all Trackpoint elements under Activities/Activity/Lap/Track
     trackpoints = []
     tp_tag = f'{{{ns}}}Trackpoint' if ns else 'Trackpoint'
     time_tag = f'{{{ns}}}Time' if ns else 'Time'
@@ -152,13 +131,72 @@ def collect_trackpoints(root):
             continue
         trackpoints.append((ts, tp))
 
-    # sort by timestamp just in case
     trackpoints.sort(key=lambda x: x[0])
     return trackpoints, ns
 
 
+def find_nearest_trackpoint(trackpoints, ref_dt):
+    # find the trackpoint with minimal absolute time difference to ref_dt
+    best = None
+    best_dt = None
+    best_diff = None
+    for ts, tp in trackpoints:
+        diff = abs((ts - ref_dt).total_seconds())
+        if best is None or diff < best_diff:
+            best = (ts, tp)
+            best_dt = ts
+            best_diff = diff
+    return best  # (ts, tp) or None
+
+
+def ensure_trackpoint_for_time(tp_tuple, new_time_dt, ns):
+    # return a deep-copied trackpoint element, with Time set to new_time_dt and
+    # ensure it has either Position or DistanceMeters node (Garmin-friendly)
+    _, tp = tp_tuple
+    new_tp = copy.deepcopy(tp)
+    tcx_ns = f'{{{ns}}}' if ns else ''
+    time_tag = tcx_ns + 'Time'
+    # replace or create Time element
+    t_elem = new_tp.find(time_tag)
+    if t_elem is None:
+        t_elem = ET.SubElement(new_tp, tcx_ns + 'Time')
+    t_elem.text = _dt_to_iso_z(new_time_dt)
+
+    # ensure there is a Position or DistanceMeters
+    pos_tag = tcx_ns + 'Position'
+    dist_tag = tcx_ns + 'DistanceMeters'
+    has_position = new_tp.find(pos_tag) is not None
+    has_distance = new_tp.find(dist_tag) is not None
+    if not has_position and not has_distance:
+        d = ET.SubElement(new_tp, tcx_ns + 'DistanceMeters')
+        d.text = '0.0'
+    return new_tp
+
+
+def compute_segment_distance_meters(trackpoints_segment, ns):
+    # If trackpoints contain DistanceMeters elements, use last-first. Otherwise 0.0
+    if not trackpoints_segment:
+        return 0.0
+    dist_tag = f'{{{ns}}}DistanceMeters' if ns else 'DistanceMeters'
+    first_dm = None
+    last_dm = None
+    for ts, tp in trackpoints_segment:
+        dm_elem = tp.find(dist_tag)
+        if dm_elem is not None and dm_elem.text:
+            try:
+                val = float(dm_elem.text)
+            except ValueError:
+                continue
+            if first_dm is None:
+                first_dm = val
+            last_dm = val
+    if first_dm is not None and last_dm is not None:
+        seg_dist = max(0.0, last_dm - first_dm)
+        return seg_dist
+    return 0.0
+
+
 def build_segment_tcx(original_root, trackpoints_segment, segment_start_dt, segment_end_dt, ns, activity_sport, activity_id_text, out_path):
-    # Build minimal TCX tree for the segment
     NS = ns
     if NS:
         ET.register_namespace('', NS)
@@ -175,16 +213,46 @@ def build_segment_tcx(original_root, trackpoints_segment, segment_start_dt, segm
     ts_el = ET.SubElement(lap, tcx_ns + 'TotalTimeSeconds')
     ts_el.text = f"{total_seconds:.1f}"
 
+    # add required Garmin-friendly fields
+    dist_m = compute_segment_distance_meters(trackpoints_segment, ns)
+    dist_el = ET.SubElement(lap, tcx_ns + 'DistanceMeters')
+    dist_el.text = f"{dist_m:.1f}"
+
+    cal_el = ET.SubElement(lap, tcx_ns + 'Calories')
+    cal_el.text = '0'
+
+    int_el = ET.SubElement(lap, tcx_ns + 'Intensity')
+    int_el.text = 'Active'
+
+    trig_el = ET.SubElement(lap, tcx_ns + 'TriggerMethod')
+    trig_el.text = 'Manual'
+
     track_el = ET.SubElement(lap, tcx_ns + 'Track')
 
     # append deep-copied trackpoints
     for ts, tp in trackpoints_segment:
-        track_el.append(copy.deepcopy(tp))
-
-    # Optionally include Creator if present in original root
-    creator = original_root.find('.//' + tcx_ns + 'Creator')
-    if creator is not None:
-        activity.append(copy.deepcopy(creator))
+        # ensure timestamp formatting on each TP
+        new_tp = copy.deepcopy(tp)
+        time_tag = tcx_ns + 'Time'
+        t_elem = new_tp.find(time_tag)
+        if t_elem is not None and t_elem.text:
+            # normalize formatting
+            try:
+                parsed = _iso_to_dt(t_elem.text.strip())
+                t_elem.text = _dt_to_iso_z(parsed)
+            except Exception:
+                t_elem.text = _dt_to_iso_z(ts)
+        else:
+            # create time element
+            t_elem = ET.SubElement(new_tp, tcx_ns + 'Time')
+            t_elem.text = _dt_to_iso_z(ts)
+        # ensure position/distance exists
+        pos_tag = tcx_ns + 'Position'
+        dist_tag = tcx_ns + 'DistanceMeters'
+        if new_tp.find(pos_tag) is None and new_tp.find(dist_tag) is None:
+            d = ET.SubElement(new_tp, tcx_ns + 'DistanceMeters')
+            d.text = '0.0'
+        track_el.append(new_tp)
 
     tree = ET.ElementTree(root)
     tree.write(out_path, encoding='utf-8', xml_declaration=True)
@@ -196,7 +264,6 @@ def main():
     inpath = args.input
     base_input_dir = args.outdir or os.path.dirname(os.path.abspath(inpath))
 
-    # always create a race_legs subfolder inside the base output directory
     outdir = os.path.join(base_input_dir, 'race_legs')
     os.makedirs(outdir, exist_ok=True)
 
@@ -215,13 +282,9 @@ def main():
     start_time = trackpoints[0][0]
     end_time = trackpoints[-1][0]
 
-    # build absolute waypoint datetimes from seconds
     wp_dts = [start_time + timedelta(seconds=sec) for sec in waypoints_secs]
-
-    # build sequence of boundaries
     boundaries = [start_time] + wp_dts + [end_time]
 
-    # extract activity attributes for recreation
     activity_el = root.find('.//' + (f'{{{ns}}}Activity' if ns else 'Activity'))
     activity_sport = activity_el.get('Sport') if activity_el is not None and activity_el.get('Sport') else 'Other'
     activity_id_el = activity_el.find(f'{{{ns}}}Id') if activity_el is not None else None
@@ -232,7 +295,6 @@ def main():
     for i in range(8):
         seg_start = boundaries[i]
         seg_end = boundaries[i+1]
-        # select trackpoints where ts >= seg_start and (ts < seg_end for non-last segment), last segment includes end
         selected = []
         for ts, tp in trackpoints:
             if ts < seg_start:
@@ -247,12 +309,21 @@ def main():
                 else:
                     break
 
+        # if no points found for this segment, duplicate the nearest trackpoint and set its time to seg_start
+        if not selected:
+            nearest = find_nearest_trackpoint(trackpoints, seg_start)
+            if nearest is not None:
+                new_tp_elem = ensure_trackpoint_for_time(nearest, seg_start, ns)
+                # create a tuple (ts, tp) using seg_start as ts
+                selected = [(seg_start, new_tp_elem)]
+                print(f'Info: segment {i} ({LEG_NAMES[i]}) had no points — duplicated nearest point at {seg_start.isoformat()}')
+            else:
+                print(f'Warning: no trackpoints available at all to duplicate for segment {i} ({LEG_NAMES[i]}). Skipping.', file=sys.stderr)
+                continue
+
         leg_name = LEG_NAMES[i]
         outname = f"{base}_{leg_name}.tcx"
         outpath = os.path.join(outdir, outname)
-
-        if not selected:
-            print(f'Warning: segment {i} ({leg_name}) has 0 trackpoints. Creating TCX with Lap metadata only.')
 
         build_segment_tcx(root, selected, seg_start, seg_end, ns, activity_sport, f"{activity_id_text}_{leg_name}", outpath)
         print(f'Wrote {outpath}  ({len(selected)} trackpoints)')
