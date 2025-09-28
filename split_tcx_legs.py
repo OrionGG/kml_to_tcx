@@ -2,36 +2,26 @@
 """
 split_tcx_legs.py
 
-Split a single TCX track into 8 legs (TCX files) using waypoint times provided
+Split a single TCX track into 8 named legs (TCX files) using waypoint times provided
 as times from the beginning of the track. Waypoints may be entered as:
   - mm:ss  (e.g. 03:30 means 3 minutes 30 seconds from start)
   - decimal minutes (e.g. 3.5 means 3.5 minutes = 3 minutes 30 seconds)
   - a comma-separated list or space-separated values
 
-Assumptions & behavior
-- The input TCX must contain at least one Activity with Trackpoints (TrainingCenterDatabase schema).
-- Waypoints are provided as 7 time values (in mm:ss or decimal minutes) in ascending order.
-- The script will create 8 TCX files (one per leg) named
-  <input_basename>_leg_01.tcx ... <input_basename>_leg_08.tcx
-- Segment boundaries are:
-    segment 0: start_of_track .. waypoint1
-    segment 1: waypoint1 .. waypoint2
-    ...
-    segment 6: waypoint6 .. waypoint7
-    segment 7: waypoint7 .. end_of_track
-- Timestamps are preserved. Lap StartTime is set to the segment start time.
-- If a segment has no trackpoints (rare), a small message is printed and an empty
-  TCX with just the Lap and no Trackpoints is still written.
+Changes requested:
+- Output files are saved in a subfolder named `race_legs` (inside the input folder or provided outdir)
+- Files are named using the prescribed leg names:
+    leg_00_pre-start
+    leg_01_upwind
+    leg_02_starboard_reach
+    leg_03_downwind
+    leg_04_upwind
+    leg_05_downwind
+    leg_06_port_reach
+    leg_07_post_finish
 
 Usage
     python split_tcx_legs.py --input /path/to/track.tcx --waypoints 0 3:30 8:12 12:00 17 21:00 24:00
-
-Or provide waypoints as a comma-separated list:
-    --waypoints "0,03:30,08:12,12:00,17,21:00,24:00"
-
-Notes
-- Each numeric value without a colon is interpreted as minutes (decimal minutes). E.g. `3.5` = 3 minutes 30 seconds.
-- Values with format `MM:SS` or `M:SS` are parsed as minutes and seconds.
 
 """
 
@@ -42,14 +32,26 @@ import copy
 import os
 import sys
 
+LEG_NAMES = [
+    'leg_00_pre-start',
+    'leg_01_upwind',
+    'leg_02_starboard_reach',
+    'leg_03_downwind',
+    'leg_04_upwind',
+    'leg_05_downwind',
+    'leg_06_port_reach',
+    'leg_07_post_finish',
+]
+
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Split TCX into 8 legs by waypoint times (mm:ss or decimal minutes)")
+    p = argparse.ArgumentParser(description="Split TCX into 8 named legs by waypoint times (mm:ss or decimal minutes)")
     p.add_argument("--input", "-i", required=True, help="Input TCX file path")
     p.add_argument("--waypoints", "-w", required=True, nargs='+',
                    help=("Seven waypoint times. Use mm:ss (e.g. 03:30) or decimal minutes (e.g. 3.5). "
                          "Either provide 7 separate values or a single comma-separated string."))
-    p.add_argument("--outdir", "-o", default=None, help="Output directory (defaults to input file folder)")
+    p.add_argument("--outdir", "-o", default=None, help="Base output directory (defaults to input file folder). "
+                   "A subfolder 'race_legs' will be created inside it.")
     return p.parse_args()
 
 
@@ -133,7 +135,6 @@ def collect_trackpoints(root):
     ns = ''
     if tag.startswith('{'):
         ns = tag[1:].split('}')[0]
-    nsmap = {'ns': ns} if ns else {}
 
     # find all Trackpoint elements under Activities/Activity/Lap/Track
     trackpoints = []
@@ -193,7 +194,10 @@ def main():
     args = parse_args()
     waypoints_secs = _parse_waypoints(args.waypoints)  # list of seconds from start
     inpath = args.input
-    outdir = args.outdir or os.path.dirname(os.path.abspath(inpath))
+    base_input_dir = args.outdir or os.path.dirname(os.path.abspath(inpath))
+
+    # always create a race_legs subfolder inside the base output directory
+    outdir = os.path.join(base_input_dir, 'race_legs')
     os.makedirs(outdir, exist_ok=True)
 
     try:
@@ -228,7 +232,7 @@ def main():
     for i in range(8):
         seg_start = boundaries[i]
         seg_end = boundaries[i+1]
-        # define inclusion: include points where ts >= seg_start and (ts < seg_end or i==7)
+        # select trackpoints where ts >= seg_start and (ts < seg_end for non-last segment), last segment includes end
         selected = []
         for ts, tp in trackpoints:
             if ts < seg_start:
@@ -238,20 +242,22 @@ def main():
                     break
                 selected.append((ts, tp))
             else:
-                # last segment -> include up to and including end
                 if ts <= seg_end:
                     selected.append((ts, tp))
                 else:
                     break
 
-        outname = f"{base}_leg_{i+1:02d}.tcx"
+        leg_name = LEG_NAMES[i]
+        outname = f"{base}_{leg_name}.tcx"
         outpath = os.path.join(outdir, outname)
+
         if not selected:
-            print(f'Warning: segment {i+1} has 0 trackpoints. Creating empty TCX with lap timestamps.')
-        build_segment_tcx(root, selected, seg_start, seg_end, ns, activity_sport, f"{activity_id_text}_leg_{i+1}", outpath)
+            print(f'Warning: segment {i} ({leg_name}) has 0 trackpoints. Creating TCX with Lap metadata only.')
+
+        build_segment_tcx(root, selected, seg_start, seg_end, ns, activity_sport, f"{activity_id_text}_{leg_name}", outpath)
         print(f'Wrote {outpath}  ({len(selected)} trackpoints)')
 
-    print('Done.')
+    print(f"All done. Legs written to: {outdir}")
 
 
 if __name__ == '__main__':
