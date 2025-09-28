@@ -5,8 +5,18 @@ split_tcx_legs.py
 Split a TCX file into 8 named legs while preserving original TCX structure
 and ensuring the ActivityExtension namespace appears with prefix "ns0" in output.
 
-Usage:
+Differences from previous version:
+- The script no longer writes a <Creator> element into the output files (per request).
+- After serialization the script post-processes the XML to ensure the root start tag
+  contains the exact namespace declarations you asked for:
+
+  <TrainingCenterDatabase xmlns:ns0="http://www.garmin.com/xmlschemas/ActivityExtension/v2"
+                          xmlns="http://www.garmin.com/xmlschemas/TrainingCenterDatabase/v2"
+                          xmlns:ns3="http://www.garmin.com/xmlschemas/ActivityExtension/v2">
+
+Usage example:
     python split_tcx_legs.py -i ./Race1/OGG.tcx -w 5:00 17:34 22:04 31:34 43:44 52:00 53:36
+
 """
 import argparse
 import copy
@@ -19,9 +29,7 @@ from datetime import datetime, timedelta
 TCX_NS = "http://www.garmin.com/xmlschemas/TrainingCenterDatabase/v2"
 ACT_EXT_NS = "http://www.garmin.com/xmlschemas/ActivityExtension/v2"
 
-# Register namespaces:
-# - default namespace with no prefix
-# - temporary prefix 'ae' for ActivityExtension; we'll post-process files to change 'ae' -> 'ns0'
+# Register namespaces: default no-prefix and a temporary prefix 'ae' for post-processing
 ET.register_namespace('', TCX_NS)
 ET.register_namespace('ae', ACT_EXT_NS)
 
@@ -41,7 +49,7 @@ def parse_args():
     p = argparse.ArgumentParser(description="Split TCX into 8 named legs preserving namespace style")
     p.add_argument('-i', '--input', required=True, help='Input TCX file path')
     p.add_argument('-w', '--waypoints', required=True, nargs='+', help='Seven waypoint times (mm:ss or decimal minutes)')
-    p.add_argument('-o', '--outdir', default=None, help='Base output dir (defaults to input file dir)')
+    p.add_argument('-o', '--outdir', default=None, help='Base output dir (defaults to input file folder)')
     return p.parse_args()
 
 
@@ -100,7 +108,6 @@ def dt_to_iso_z(dt: datetime) -> str:
 
 
 def haversine_m(lat1, lon1, lat2, lon2):
-    # returns meters
     R = 6371000.0
     phi1 = math.radians(lat1)
     phi2 = math.radians(lat2)
@@ -146,7 +153,6 @@ def compute_segment_metrics(trackpoints, tcx_ns_braced):
         else:
             positions.append(None)
 
-        # look for ae:Speed inside Extensions -> will serialize using 'ae' prefix
         ext = tp.find(tcx_ns_braced + 'Extensions')
         if ext is not None:
             for child in ext:
@@ -160,7 +166,6 @@ def compute_segment_metrics(trackpoints, tcx_ns_braced):
         return 0.0, 0.0, 0.0
     total_seconds = (times[-1] - times[0]).total_seconds()
 
-    # distance sum for adjacent positions
     dist_m = 0.0
     prev_pos = None
     prev_time = None
@@ -179,7 +184,6 @@ def compute_segment_metrics(trackpoints, tcx_ns_braced):
                 dt = (cur_time - prev_time).total_seconds()
                 if dt > 0:
                     computed_speeds.append(seg / dt)
-        # update
         try:
             prev_pos = pos
             prev_time = times[idx]
@@ -187,7 +191,6 @@ def compute_segment_metrics(trackpoints, tcx_ns_braced):
             prev_pos = pos
             prev_time = None
 
-    # determine max speed
     max_speed = 0.0
     if ext_speeds:
         try:
@@ -203,7 +206,6 @@ def compute_segment_metrics(trackpoints, tcx_ns_braced):
 
 
 def build_segment_file_preserve(trackpoints_segment, activity_sport, activity_id_text, out_path):
-    # create root using default TCX namespace (no prefix)
     tcx_ns_braced = f'{{{TCX_NS}}}'
     root = ET.Element(tcx_ns_braced + 'TrainingCenterDatabase')
 
@@ -212,7 +214,6 @@ def build_segment_file_preserve(trackpoints_segment, activity_sport, activity_id
     id_el = ET.SubElement(activity, tcx_ns_braced + 'Id')
     id_el.text = activity_id_text
 
-    # Lap start from first TP time (string)
     if trackpoints_segment:
         first_tp = trackpoints_segment[0]
         t_el = first_tp.find(tcx_ns_braced + 'Time')
@@ -222,23 +223,17 @@ def build_segment_file_preserve(trackpoints_segment, activity_sport, activity_id
 
     lap = ET.SubElement(activity, tcx_ns_braced + 'Lap', {'StartTime': lap_start})
 
-    # compute metrics and write them
     total_time_s, dist_m, max_speed = compute_segment_metrics(trackpoints_segment, tcx_ns_braced)
     ET.SubElement(lap, tcx_ns_braced + 'TotalTimeSeconds').text = f"{total_time_s:.1f}"
     ET.SubElement(lap, tcx_ns_braced + 'DistanceMeters').text = f"{dist_m:.6f}"
     ET.SubElement(lap, tcx_ns_braced + 'MaximumSpeed').text = f"{max_speed:.2f}"
 
-    # Track and deep-copy original Trackpoints (preserving Extensions etc.)
     track_el = ET.SubElement(lap, tcx_ns_braced + 'Track')
     for tp in trackpoints_segment:
         track_el.append(copy.deepcopy(tp))
 
-    # Creator (minimal)
-    creator = ET.SubElement(activity, tcx_ns_braced + 'Creator')
-    name = ET.SubElement(creator, tcx_ns_braced + 'Name')
-    name.text = 'split_tcx_legs'
+    # NOTE: Creator intentionally omitted (per request)
 
-    # write file with UTF-8 declaration
     tree = ET.ElementTree(root)
     try:
         ET.indent(tree, space="  ")
@@ -246,16 +241,22 @@ def build_segment_file_preserve(trackpoints_segment, activity_sport, activity_id
         pass
     tree.write(out_path, encoding='UTF-8', xml_declaration=True)
 
-    # Post-process the file to replace 'ae' prefix with 'ns0' so it matches your original style
-    # Replace xmlns:ae= -> xmlns:ns0= and <ae: -> <ns0: and </ae: -> </ns0:
-    # This is a safe textual swap because 'ae' was chosen solely for this namespace.
+    # Post-process: swap temporary 'ae' prefix to 'ns0' and ensure xmlns:ns3 is present
     with open(out_path, 'r', encoding='UTF-8') as f:
         txt = f.read()
     txt = txt.replace('xmlns:ae="', 'xmlns:ns0="')
     txt = txt.replace('<ae:', '<ns0:')
     txt = txt.replace('</ae:', '</ns0:')
-    # Also handle the case where ElementTree uses qualified names in attributes (rare)
     txt = txt.replace(' ae:', ' ns0:')
+    # ensure xmlns:ns3 declaration exists on the TrainingCenterDatabase start tag
+    if 'xmlns:ns3=' not in txt:
+        # insert xmlns:ns3 after xmlns:ns0 declaration if present
+        insert_after = 'xmlns:ns0="' + ACT_EXT_NS + '"'
+        if insert_after in txt:
+            txt = txt.replace(insert_after, insert_after + ' xmlns:ns3="' + ACT_EXT_NS + '"')
+        else:
+            # fallback: insert right after <TrainingCenterDatabase
+            txt = txt.replace('<TrainingCenterDatabase', '<TrainingCenterDatabase xmlns:ns0="' + ACT_EXT_NS + '" xmlns:ns3="' + ACT_EXT_NS + '"')
     with open(out_path, 'w', encoding='UTF-8') as f:
         f.write(txt)
 
@@ -311,7 +312,6 @@ def main():
                     break
 
         if not seg_tps:
-            # duplicate nearest and set its Time to seg_start
             def time_diff(tp):
                 t = tp.find(tcx_ns_braced + 'Time')
                 if t is None or not t.text:
