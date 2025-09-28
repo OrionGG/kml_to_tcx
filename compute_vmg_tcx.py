@@ -106,12 +106,7 @@ def write_vmg_to_tcx(tree, root, ns, points, vmg_list, out_path, precision=3, ve
     
     for i, p in enumerate(points):
         tp = p['elem']
-        
-        # Remove any existing AltitudeMeters elements
-        alt_elements = tp.findall('ns:AltitudeMeters', nsmap) if ns else tp.findall('AltitudeMeters')
-        for alt_elem in alt_elements:
-            tp.remove(alt_elem)
-        
+               
         # Find Extensions -> ns0:TPX -> ns0:Speed path
         extensions = tp.find('ns:Extensions', nsmap) if ns else tp.find('Extensions')
         if extensions is not None:
@@ -131,7 +126,20 @@ def write_vmg_to_tcx(tree, root, ns, points, vmg_list, out_path, precision=3, ve
                     if verbose: print(f"Updated trackpoint {i} speed to: {speed_elem.text}")
     
     if verbose: print(f"Writing new TCX to: {out_path}")
-    tree.write(out_path, encoding='utf-8', xml_declaration=True)
+    tree.write(out_path, encoding='UTF-8', xml_declaration=True)
+    
+    # Post-process the file to replace ns1: with ns0:
+    if verbose: print("Post-processing: replacing ns1: with ns0:")
+    with open(out_path, 'r', encoding='UTF-8') as f:
+        content = f.read()
+    
+    # Replace ns1: with ns0: in the content
+    content = content.replace('ns1:', 'ns0:')
+    
+    with open(out_path, 'w', encoding='UTF-8') as f:
+        f.write(content)
+    
+    if verbose: print("Post-processing complete")
 
 # VMG calculations
 def compute_wind_bearing(points, method='first-last', custom_deg=None):
@@ -162,12 +170,15 @@ def compute_vmg_list(points, wind_bearing):
             dist = haversine_m(p0['lat'], p0['lon'], p1['lat'], p1['lon'])
             speed = dist / dt
             br = bearing_deg(p0['lat'], p0['lon'], p1['lat'], p1['lon'])
+        print(f"Segment {i}: dt={dt:.1f}s, dist={dist:.1f}m, speed={speed:.2f}m/s, bearing={br if br is not None else 'N/A'}")
         if br is None:
             vmg = 0.0
         else:
             delta_deg = angle_diff_deg(wind_bearing, br)
+            print(f"  Wind bearing: {wind_bearing:.2f}°, Boat bearing: {br:.2f}°, Delta: {delta_deg:.2f}°")
             delta = radians(delta_deg)
             vmg = speed * cos(delta)
+            print(f"speed:{speed},   VMG: {vmg:.2f} m/s")
         vmg_list.append(vmg)
         speeds.append(speed)
         bearings.append(br if br is not None else float('nan'))
